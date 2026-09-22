@@ -1,5 +1,13 @@
 export type Point2D = { x: number; y: number };
 
+// An obstacle can optionally carry a semantic dilation radius (in grid
+// cells) so that, e.g., a 'person' pushes the planned path much further
+// away than a 'rock/obstacle' does. See backend/obstacle_classes.py for
+// where avoidRadiusM originates -- convert meters -> cells at the call site
+// using the same grid resolution the caller is using (TelemetryContext.tsx
+// uses 0.5m/cell today).
+export type PlannerObstacle = Point2D & { radiusCells?: number };
+
 // Represents a node in the A* grid
 class Node {
   x: number;
@@ -24,7 +32,7 @@ const heuristic = (a: Node, b: Node) => {
 
 export const findPathAStar = (
   gridSize: number, // e.g., 40 for a 40x40 grid
-  obstacles: Point2D[], // Array of obstacle grid coordinates
+  obstacles: PlannerObstacle[], // Array of obstacle grid coordinates, optionally with per-class radius
   startCoord: Point2D,
   endCoord: Point2D
 ): Point2D[] | null => {
@@ -38,12 +46,15 @@ export const findPathAStar = (
   }
 
   // 2. Mark obstacles (with safety buffer dilation)
-  // Dilation radius = 1 cell (0.5m)
+  // Dilation radius defaults to 1 cell (0.5m) but scales up per-obstacle
+  // when the caller supplies a semantic radiusCells (e.g. a 'person'
+  // dilates much further than a 'rock/obstacle' -- see obstacle_classes.py).
   obstacles.forEach(obs => {
     const rx = Math.round(obs.x);
     const ry = Math.round(obs.y);
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dy = -1; dy <= 1; dy++) {
+    const radius = Math.max(1, Math.round(obs.radiusCells ?? 1));
+    for (let dx = -radius; dx <= radius; dx++) {
+      for (let dy = -radius; dy <= radius; dy++) {
         const nx = rx + dx;
         const ny = ry + dy;
         if (nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize) {

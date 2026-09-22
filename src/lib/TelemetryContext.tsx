@@ -1,7 +1,26 @@
 "use client";
 
 import React, { createContext, useContext, useEffect, useState, useRef } from "react";
-import { findPathAStar, Point2D } from "./pathfinding";
+import { findPathAStar, Point2D, PlannerObstacle } from "./pathfinding";
+import { EKFLocalizer } from "./ekf";
+import { computeDwaCommand, DwaObstacle, DEFAULT_DWA_CONFIG } from "./dwa";
+
+// Meters-per-grid-cell used everywhere obstacles/pose are converted between
+// world (meters) and planner-grid (cells) coordinates. Kept in one place so
+// pathfinding.ts, dwa.ts, and this file never drift apart.
+const GRID_RESOLUTION_M = 0.5;
+
+// World-frame obstacle carrying the semantic metadata from
+// backend/obstacle_classes.py, used by both A* (grid dilation) and DWA
+// (clearance scoring).
+type WorldObstacle = { x: number; y: number; label: string; avoidRadiusM: number; riskWeight: number; isDynamic: boolean };
+
+function gaussianNoise(stdDev: number): number {
+  // Box-Muller transform for approximately-normal sensor noise.
+  const u1 = Math.max(Math.random(), 1e-9);
+  const u2 = Math.random();
+  return stdDev * Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
+}
 
 export type TelemetryLogEntry = {
   time: number;
@@ -14,7 +33,7 @@ export type TelemetryData = {
   imu: { roll: number; pitch: number; yaw: number };
   encoders: { leftTicks: number; rightTicks: number; leftRpm: number; rightRpm: number; velocity: number };
   ultrasonic: { frontLeft: number; frontRight: number };
-  ekf: { driftX: number; driftY: number; history: {x: number, y: number}[] };
+  ekf: { driftX: number; driftY: number; history: {x: number, y: number}[]; positionStdM: number };
   localization: { x: number; y: number; theta: number };
   motors: { leftSpeed: number; rightSpeed: number };
   navigation: {
@@ -39,7 +58,7 @@ const defaultData: TelemetryData = {
   imu: { roll: 0, pitch: 0, yaw: 0 },
   encoders: { leftTicks: 0, rightTicks: 0, leftRpm: 0, rightRpm: 0, velocity: 0 },
   ultrasonic: { frontLeft: 100, frontRight: 100 },
-  ekf: { driftX: 0, driftY: 0, history: [] },
+  ekf: { driftX: 0, driftY: 0, history: [], positionStdM: 0 },
   localization: { x: 10, y: 10, theta: -Math.PI / 2 }, // Pointing "UP"
   motors: { leftSpeed: 0, rightSpeed: 0 },
   navigation: { waypoint: null, path: [], obstacles: [], status: "Idle" },
@@ -70,8 +89,25 @@ export const TelemetryProvider = ({ children }: { children: React.ReactNode }) =
   const dataRef = useRef(data);
   const loopRef = useRef<number | null>(null);
   
-  // Real-time backend obstacle data
-  const backendObstaclesRef = useRef<Point2D[]>([]);
+  // Real-time backend obstacle data, with semantic class metadata attached
+  // (label/avoidRadiusM/riskWeight/isDynamic from backend/obstacle_classes.py)
+  const backendObstaclesRef = useRef<WorldObstacle[]>([]);
+
+  // Canonical EKF localizer (real predict/update filter -- see ekf.ts).
+  // This IS the rover's pose estimate; there is no ground-truth GPS to
+  // compare against, which is the point of a GPS-denied filter. We also
+  // track a noise-free `trueTheta/trueX/trueY` purely so the *simulation*
+  // has something physically consistent to integrate before the EKF's
+  // sensor noise is applied on top -- this stands in for "the physical
+  // rover" until real encoder/IMU hardware replaces it.
+  const ekfRef = useRef<EKFLocalizer>((() => {
+    const ekf = new EKFLocalizer();
+    ekf.state = [defaultData.localization.x, defaultData.localization.y, defaultData.localization.theta];
+    return ekf;
+  })());
+  const groundTruthRef = useRef({ x: defaultData.localization.x, y: defaultData.localization.y, theta: defaultData.localization.theta });
+  const lastCommandRef = useRef({ v: 0, omega: 0 });
+  const tickCountRef = useRef(0);
 
   // Manual input state
   const keys = useRef<{ [key: string]: boolean }>({});
@@ -118,27 +154,32 @@ export const TelemetryProvider = ({ children }: { children: React.ReactNode }) =
 
           if (payload.obstacles && Array.isArray(payload.obstacles)) {
             setObstacles(payload.obstacles);
-            
-            // Map the obstacles from relative pixel coords to world grid coords
-            // Assume rover is at data.localization, theta is heading
-            // rel_x is horizontal pixel offset, rel_y is vertical
 
-            // Let's use a simple linear map: 100 px = 1 meter
-            const currentLoc = dataRef.current.localization;
-            
-            const mappedObstacles: Point2D[] = payload.obstacles.map((obs: any) => {
-              const distForward = (obs.y_rel / 100) + 5; // Base 5 meters ahead + pixel offset
-              const distRight = (obs.x_rel / 100);
+            // Map obstacles using the backend's real IPM metric projection
+            // (metric_pos = [distance_right_m, distance_forward_m] from
+            // mapping.py's IPMProjector), not a guessed pixel-to-meter
+            // ratio. Rotate into world frame using the EKF's current pose
+            // estimate (the only pose estimate we have -- no GPS).
+            const currentPose = ekfRef.current.pose();
 
-              // Rotate by rover's theta to place globally
-              const dx = distForward * Math.cos(currentLoc.theta) - distRight * Math.sin(currentLoc.theta);
-              const dy = distForward * Math.sin(currentLoc.theta) + distRight * Math.cos(currentLoc.theta);
+            const mappedObstacles: WorldObstacle[] = payload.obstacles
+              .filter((obs: any) => Array.isArray(obs.metric_pos))
+              .map((obs: any) => {
+                const distRight = obs.metric_pos[0];
+                const distForward = obs.metric_pos[1];
 
-              return {
-                x: currentLoc.x + dx,
-                y: currentLoc.y + dy
-              };
-            });
+                const dx = distForward * Math.cos(currentPose.theta) - distRight * Math.sin(currentPose.theta);
+                const dy = distForward * Math.sin(currentPose.theta) + distRight * Math.cos(currentPose.theta);
+
+                return {
+                  x: currentPose.x + dx,
+                  y: currentPose.y + dy,
+                  label: obs.label ?? "unknown",
+                  avoidRadiusM: obs.avoid_radius_m ?? 0.35,
+                  riskWeight: obs.risk_weight ?? 1.0,
+                  isDynamic: obs.is_dynamic ?? false,
+                };
+              });
 
             backendObstaclesRef.current = mappedObstacles;
           }
@@ -274,82 +315,142 @@ export const TelemetryProvider = ({ children }: { children: React.ReactNode }) =
         }
 
         const t = Date.now() / 1000;
-        
+        const dt = 0.1;
+        tickCountRef.current += 1;
+
+        // Current pose is the EKF's estimate -- this is the only "position"
+        // the rest of the pipeline (A*, DWA, rendering) is allowed to see.
+        const currentPose = ekfRef.current.pose();
+
         let velocity = 0;
-        let steer = 0;
-        let newX = prev.localization.x;
-        let newY = prev.localization.y;
-        let newTheta = prev.localization.theta;
+        let omega = 0; // rad/s, replaces the old ad-hoc "steer" scalar
+        let navStatus = prev.navigation.status;
+        let newPath: Point2D[] = prev.navigation.path;
+
+        // Obstacles in world frame, carrying semantic class metadata used by
+        // both A* (grid dilation) and DWA (clearance scoring/weighting).
+        const worldObstacles = backendObstaclesRef.current;
 
         if (prev.status.controlMode === "Manual") {
           if (keys.current["w"]) velocity = 1.5;
           if (keys.current["s"]) velocity = -1.5;
-          if (keys.current["a"]) steer = -1.0;
-          if (keys.current["d"]) steer = 1.0;
-        } else {
-          // Auto
-          if (prev.navigation.waypoint && prev.navigation.path.length > 1) {
-            const nextTarget = prev.navigation.path[1];
-            const targetX = nextTarget.x * 0.5 + 0.25;
-            const targetY = nextTarget.y * 0.5 + 0.25;
-            const dx = targetX - prev.localization.x;
-            const dy = targetY - prev.localization.y;
-            const desiredTheta = Math.atan2(dy, dx);
-            
-            let angleDiff = desiredTheta - prev.localization.theta;
-            while (angleDiff > Math.PI) angleDiff -= Math.PI * 2;
-            while (angleDiff < -Math.PI) angleDiff += Math.PI * 2;
+          if (keys.current["a"]) omega = -1.0;
+          if (keys.current["d"]) omega = 1.0;
+        } else if (prev.navigation.waypoint) {
+          // 1. Global plan: A* over a coarse grid, obstacles dilated by
+          // their semantic avoid radius (a 'person' pushes the path much
+          // further away than a 'rock/obstacle' -- see obstacle_classes.py).
+          const startGrid = { x: Math.floor(currentPose.x / GRID_RESOLUTION_M), y: Math.floor(currentPose.y / GRID_RESOLUTION_M) };
+          const endGrid = { x: Math.floor(prev.navigation.waypoint.x / GRID_RESOLUTION_M), y: Math.floor(prev.navigation.waypoint.y / GRID_RESOLUTION_M) };
+          const gridObstacles: PlannerObstacle[] = worldObstacles.map(o => ({
+            x: o.x / GRID_RESOLUTION_M,
+            y: o.y / GRID_RESOLUTION_M,
+            radiusCells: o.avoidRadiusM / GRID_RESOLUTION_M,
+          }));
+          const path = findPathAStar(40, gridObstacles, startGrid, endGrid);
 
-            steer = angleDiff * 2.0; 
-            velocity = Math.abs(angleDiff) > 0.5 ? 0.5 : 1.2;
-            
-            const distToGoal = Math.hypot(prev.navigation.waypoint.x - prev.localization.x, prev.navigation.waypoint.y - prev.localization.y);
-            if (distToGoal < 0.5) { velocity = 0; steer = 0; }
-          } else if (!prev.navigation.waypoint) {
-            velocity = 0;
-            steer = 0;
-          }
-        }
+          const distToGoal = Math.hypot(prev.navigation.waypoint.x - currentPose.x, prev.navigation.waypoint.y - currentPose.y);
 
-        const dt = 0.1;
-        newTheta += steer * dt;
-        newX += velocity * Math.cos(newTheta) * dt;
-        newY += velocity * Math.sin(newTheta) * dt;
-
-        newX = Math.max(1, Math.min(19, newX));
-        newY = Math.max(1, Math.min(19, newY));
-
-        const fl = 50 + Math.sin(t * 1.5) * 40 + Math.random() * 5;
-        const fr = 50 + Math.cos(t * 1.2) * 40 + Math.random() * 5;
-
-        // Take obstacles exclusively from backend now (plus static boundaries if any, we can omit for now to see pure dynamic)
-        const allObstacles = [...backendObstaclesRef.current];
-
-        let newPath: Point2D[] = prev.navigation.path;
-        let navStatus = prev.navigation.status;
-        
-        if (prev.status.controlMode === "Auto" && prev.navigation.waypoint) {
-          const startGrid = { x: Math.floor(newX * 2), y: Math.floor(newY * 2) };
-          const endGrid = { x: Math.floor(prev.navigation.waypoint.x * 2), y: Math.floor(prev.navigation.waypoint.y * 2) };
-          // Run A* continuously to dynamically avoid the real obstacles sent by the backend WS
-          const path = findPathAStar(40, allObstacles, startGrid, endGrid);
-          if (path) {
+          if (distToGoal < 0.4) {
+            navStatus = "Clear";
+            newPath = [];
+          } else if (path) {
             newPath = path;
             navStatus = "Clear";
+
+            // 2. Local plan: DWA picks the next (v, omega) that makes
+            // progress toward the next global waypoint while staying clear
+            // of every obstacle's semantic footprint -- this is the
+            // reactive layer A* alone doesn't provide.
+            const lookahead = path.length > 2 ? path[2] : path[path.length - 1];
+            const goalWorld = {
+              x: lookahead.x * GRID_RESOLUTION_M + GRID_RESOLUTION_M / 2,
+              y: lookahead.y * GRID_RESOLUTION_M + GRID_RESOLUTION_M / 2,
+            };
+            const dwaObstacles: DwaObstacle[] = worldObstacles.map(o => ({
+              x: o.x,
+              y: o.y,
+              avoidRadiusM: o.avoidRadiusM,
+              riskWeight: o.riskWeight,
+            }));
+
+            const command = computeDwaCommand(
+              currentPose,
+              lastCommandRef.current.v,
+              lastCommandRef.current.omega,
+              goalWorld,
+              dwaObstacles,
+              DEFAULT_DWA_CONFIG
+            );
+
+            if (command.blocked) {
+              navStatus = "Blocked";
+              velocity = 0;
+              omega = 0;
+            } else {
+              velocity = command.v;
+              omega = command.omega;
+            }
           } else {
             navStatus = "Blocked";
-            velocity = 0; 
+            velocity = 0;
+            omega = 0;
             newPath = [];
           }
         }
 
-        // EKF Drift Simulation
-        const driftX = prev.ekf.driftX + (Math.random() - 0.5) * 0.05;
-        const driftY = prev.ekf.driftY + (Math.random() - 0.5) * 0.05;
-        const newHistory = [...prev.ekf.history, {x: driftX, y: driftY}].slice(-50); 
+        lastCommandRef.current = { v: velocity, omega };
 
-        const leftSpeed = velocity - steer * 0.5;
-        const rightSpeed = velocity + steer * 0.5;
+        // --- Ground truth vs. EKF estimate -------------------------------
+        // groundTruthRef stands in for "the physical rover" until real
+        // encoder/IMU hardware exists: it integrates the *commanded*
+        // velocity/omega with no noise. The EKF only ever sees noisy
+        // versions of that command (simulating real wheel-slip + gyro
+        // noise), so it drifts from ground truth between corrections --
+        // exactly like it would with real hardware.
+        const gt = groundTruthRef.current;
+        const newGtTheta = gt.theta + omega * dt;
+        const newGt = {
+          x: Math.max(1, Math.min(19, gt.x + velocity * Math.cos(newGtTheta) * dt)),
+          y: Math.max(1, Math.min(19, gt.y + velocity * Math.sin(newGtTheta) * dt)),
+          theta: newGtTheta,
+        };
+        groundTruthRef.current = newGt;
+
+        // Simulated wheel-encoder + gyro noise fed into the EKF's predict step.
+        const vNoisy = velocity * (1 + gaussianNoise(0.03));
+        const omegaNoisy = omega * (1 + gaussianNoise(0.05)) + gaussianNoise(0.01);
+        ekfRef.current.predict(vNoisy, omegaNoisy, dt);
+
+        // Simulated absolute-heading IMU correction (~once per second),
+        // standing in for a real MPU6050 AHRS fix until hardware is wired in.
+        if (tickCountRef.current % 10 === 0) {
+          ekfRef.current.updateHeading(newGt.theta + gaussianNoise(0.03));
+        }
+
+        // Clamp the EKF's own position estimate to the arena bounds so a
+        // drifting filter can't wander the rendered pose off-canvas.
+        ekfRef.current.state[0] = Math.max(1, Math.min(19, ekfRef.current.state[0]));
+        ekfRef.current.state[1] = Math.max(1, Math.min(19, ekfRef.current.state[1]));
+
+        const estimatedPose = ekfRef.current.pose();
+        const newX = estimatedPose.x;
+        const newY = estimatedPose.y;
+        const newTheta = estimatedPose.theta;
+
+        const fl = 50 + Math.sin(t * 1.5) * 40 + Math.random() * 5;
+        const fr = 50 + Math.cos(t * 1.2) * 40 + Math.random() * 5;
+
+        // ekf history/drift now reflects the *real* filter: how far the
+        // estimate has actually diverged from ground truth, and the
+        // filter's own reported uncertainty (position_std, from its
+        // covariance), rather than an unconditioned random walk.
+        const driftX = newX - newGt.x;
+        const driftY = newY - newGt.y;
+        const newHistory = [...prev.ekf.history, { x: newX, y: newY }].slice(-50);
+
+        const leftSpeed = velocity - omega * 0.5;
+        const rightSpeed = velocity + omega * 0.5;
 
         const newLogEntry = {
           time: Date.now(), roll: Math.sin(t * 2) * 2, pitch: Math.cos(t * 1.5) * 3, yaw: (newTheta * 180) / Math.PI,
@@ -362,10 +463,10 @@ export const TelemetryProvider = ({ children }: { children: React.ReactNode }) =
           imu: { roll: Math.sin(t * 2) * 2, pitch: Math.cos(t * 1.5) * 3, yaw: (newTheta * 180) / Math.PI },
           encoders: { leftTicks: prev.encoders.leftTicks + Math.abs(leftSpeed*10), rightTicks: prev.encoders.rightTicks + Math.abs(rightSpeed*10), leftRpm: leftSpeed * 60, rightRpm: rightSpeed * 60, velocity },
           ultrasonic: { frontLeft: fl, frontRight: fr },
-          ekf: { driftX, driftY, history: newHistory },
+          ekf: { driftX, driftY, history: newHistory, positionStdM: estimatedPose.positionStdM },
           localization: { x: newX, y: newY, theta: newTheta },
           motors: { leftSpeed, rightSpeed },
-          navigation: { ...prev.navigation, path: newPath, obstacles: allObstacles, status: navStatus },
+          navigation: { ...prev.navigation, path: newPath, obstacles: worldObstacles.map(o => ({ x: o.x, y: o.y })), status: navStatus },
           logs: newLogs
         };
       });
