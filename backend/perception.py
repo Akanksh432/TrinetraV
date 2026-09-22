@@ -1,3 +1,10 @@
+import torch
+import time
+
+# Set physical core count for CPU inference (configurable)
+CPU_INFERENCE_THREADS = 4
+torch.set_num_threads(CPU_INFERENCE_THREADS)
+
 from typing import Any, Dict, List, Tuple
 import cv2
 import numpy as np
@@ -5,12 +12,15 @@ from ultralytics import YOLO
 from mapping import IPMProjector
 from terrain import TerrainSegmenter
 from obstacle_classes import get_profile
-
+from tracker import CentroidTracker
 
 class DualPerceptionEngine:
   def __init__(self, weights_path: str = 'yolov8n.pt'):
     # Load model on available device
     self.model = YOLO(weights_path)
+    # Fuse conv+batchnorm layers for faster CPU inference
+    self.model.fuse()
+    
     # Target resolution for fast AI inference
     self.infer_width = 640
     self.infer_height = 360
@@ -21,6 +31,9 @@ class DualPerceptionEngine:
     # Real terrain hazard segmenter (SLIC superpixels + appearance model),
     # replaces the old single adaptive-threshold hack.
     self.terrain = TerrainSegmenter()
+    
+    # Minimal tracking for frame-skip continuity
+    self.tracker = CentroidTracker(max_disappeared=5, max_distance=60)
 
     # Ground corridor polygon (same trapezoid used for both hazard search
     # and the anchor "known safe ground" patch).
@@ -44,9 +57,12 @@ class DualPerceptionEngine:
         int(self.infer_width * 0.65),
         self.infer_height - 1,
     )
+    
+    # Profiling variables
+    self.profiling = {'yolo': 0, 'seg': 0, 'trk': 0, 'skip': 0, 'count': 0, 'skip_count': 0}
 
   def process(
-      self, frame: np.ndarray
+      self, frame: np.ndarray, run_inference: bool = True
   ) -> Tuple[np.ndarray, Dict[str, Any]]:
     orig_h, orig_w = frame.shape[:2]
 
@@ -59,59 +75,91 @@ class DualPerceptionEngine:
 
     obstacles: List[Dict[str, Any]] = []
 
-    # 2. Run YOLO for known dynamic/static object classes (people, vehicles,
-    # animals, etc). Real classification -- model.names gives the true class,
-    # not a generic "obstacle" bucket.
-    results = self.model(small_frame, conf=0.45, verbose=False)[0]
-    for box in results.boxes:
-      cls_id = int(box.cls[0])
-      label = self.model.names[cls_id]
-      conf = float(box.conf[0])
-      x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+    if run_inference:
+        # 2. Run YOLO for known dynamic/static object classes
+        # Using explicit .predict for speed (avoids unbatched/full-res defaults)
+        t0 = time.time()
+        results = self.model.predict(
+            small_frame, 
+            imgsz=320, 
+            conf=0.35, 
+            iou=0.45, 
+            verbose=False, 
+            device="cpu"
+        )[0]
+        self.profiling['yolo'] += (time.time() - t0)
+        
+        raw_detections = []
+        for box in results.boxes:
+          cls_id = int(box.cls[0])
+          label = self.model.names[cls_id]
+          conf = float(box.conf[0])
+          x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
 
-      bbox_small = [int(x1), int(y1), int(x2), int(y2)]
-      metric_x, metric_y = self.projector.project_to_ground(bbox_small)
-      profile = get_profile(label)
+          bbox_small = [int(x1), int(y1), int(x2), int(y2)]
+          metric_x, metric_y = self.projector.project_to_ground(bbox_small)
+          profile = get_profile(label)
 
-      obstacles.append({
-          'label': label,
-          'conf': round(conf, 2),
-          'bbox': [
-              int(x1 * scale_x),
-              int(y1 * scale_y),
-              int(x2 * scale_x),
-              int(y2 * scale_y),
-          ],
-          'metric_pos': [metric_x, metric_y],
-          'avoid_radius_m': profile['avoid_radius_m'],
-          'risk_weight': profile['risk_weight'],
-          'is_dynamic': profile['is_dynamic'],
-      })
+          raw_detections.append({
+              'label': label,
+              'conf': round(conf, 2),
+              'bbox': [
+                  int(x1 * scale_x),
+                  int(y1 * scale_y),
+                  int(x2 * scale_x),
+                  int(y2 * scale_y),
+              ],
+              'metric_pos': [metric_x, metric_y],
+              'avoid_radius_m': profile['avoid_radius_m'],
+              'risk_weight': profile['risk_weight'],
+              'is_dynamic': profile['is_dynamic'],
+          })
 
-    # 3. Terrain Hazard Detector: self-supervised SLIC segmentation against
-    # a "known safe ground" anchor patch (see terrain.py). Classifies each
-    # anomaly as rock/obstacle, ditch/hole, or minor loose_terrain instead of
-    # lumping everything into one generic label.
-    hazards = self.terrain.segment(small_frame, self.corridor_mask, self.anchor_rect)
-    for hz in hazards:
-      metric_x, metric_y = self.projector.project_to_ground(hz['bbox'])
-      profile = get_profile(hz['label'])
-      rx1, ry1, rx2, ry2 = hz['bbox']
+        # 3. Terrain Hazard Detector
+        t0 = time.time()
+        hazards = self.terrain.segment(small_frame, self.corridor_mask, self.anchor_rect)
+        self.profiling['seg'] += (time.time() - t0)
+        
+        for hz in hazards:
+          metric_x, metric_y = self.projector.project_to_ground(hz['bbox'])
+          profile = get_profile(hz['label'])
+          rx1, ry1, rx2, ry2 = hz['bbox']
 
-      obstacles.append({
-          'label': hz['label'],
-          'conf': hz['conf'],
-          'bbox': [
-              int(rx1 * scale_x),
-              int(ry1 * scale_y),
-              int(rx2 * scale_x),
-              int(ry2 * scale_y),
-          ],
-          'metric_pos': [metric_x, metric_y],
-          'avoid_radius_m': profile['avoid_radius_m'],
-          'risk_weight': profile['risk_weight'],
-          'is_dynamic': profile['is_dynamic'],
-      })
+          raw_detections.append({
+              'label': hz['label'],
+              'conf': hz['conf'],
+              'bbox': [
+                  int(rx1 * scale_x),
+                  int(ry1 * scale_y),
+                  int(rx2 * scale_x),
+                  int(ry2 * scale_y),
+              ],
+              'metric_pos': [metric_x, metric_y],
+              'avoid_radius_m': profile['avoid_radius_m'],
+              'risk_weight': profile['risk_weight'],
+              'is_dynamic': profile['is_dynamic'],
+          })
+        
+        t0 = time.time()
+        obstacles = self.tracker.update(raw_detections)
+        self.profiling['trk'] += (time.time() - t0)
+        self.profiling['count'] += 1
+        
+        if self.profiling['count'] >= 10:
+            p = self.profiling
+            n = p['count']
+            s_n = max(1, p['skip_count'])
+            print(f"[PERCEPTION AI] YOLO: {p['yolo']/n*1000:.1f}ms | Seg: {p['seg']/n*1000:.1f}ms | Trk: {p['trk']/n*1000:.1f}ms | Skip: {p['skip']/s_n*1000:.1f}ms")
+            self.profiling = {k: 0 for k in self.profiling}
+            
+    else:
+        t0 = time.time()
+        obstacles = self.tracker.predict_skipped_frame(inference_stride=3)
+        # Ensure boxes remain integers after translation
+        for obs in obstacles:
+            obs['bbox'] = [int(x) for x in obs['bbox']]
+        self.profiling['skip'] += (time.time() - t0)
+        self.profiling['skip_count'] += 1
 
     # 4. Generate annotated output frame
     vis_frame = frame.copy()
@@ -130,18 +178,20 @@ class DualPerceptionEngine:
     cv2.fillPoly(overlay, [corridor_pts_full], (0, 200, 50))
     vis_frame = cv2.addWeighted(overlay, 0.25, vis_frame, 0.75, 0)
 
-    # Draw bounding boxes, colored by risk tier so hazard severity is visible
-    # on the video feed itself, not just in the telemetry JSON.
+    # Draw bounding boxes, colored by risk tier
     for obs in obstacles:
       bx1, by1, bx2, by2 = obs['bbox']
       if obs['risk_weight'] >= 4.0:
-        color = (0, 0, 255)      # red: high risk (people/vehicles/ditches)
+        color = (0, 0, 255)      # red: high risk
       elif obs['risk_weight'] >= 2.0:
-        color = (0, 140, 255)    # orange: moderate (rocks, static objects)
+        color = (0, 140, 255)    # orange: moderate
       else:
-        color = (0, 220, 220)    # yellow: minor terrain
+        color = (0, 220, 220)    # yellow: minor
       cv2.rectangle(vis_frame, (bx1, by1), (bx2, by2), color, 2)
-      tag = f"{obs['label'].upper()} {int(obs['conf']*100)}%"
+      
+      # Use track_id to show stable identity
+      trk_id = obs.get('track_id', '?')
+      tag = f"[{trk_id}] {obs['label'].upper()} {int(obs['conf']*100)}%"
       cv2.putText(
           vis_frame,
           tag,

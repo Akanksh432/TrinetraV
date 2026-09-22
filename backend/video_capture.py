@@ -2,9 +2,10 @@ import cv2
 import threading
 import time
 import numpy as np
+import queue
 
 class UVCVideoStream:
-    def __init__(self, src_options=[0, 1], resolution=(640, 480)):
+    def __init__(self, src_options=[0, 1], resolution=(320, 240)):
         self.resolution = resolution
         self.stream = None
         self.device_index = None
@@ -34,14 +35,14 @@ class UVCVideoStream:
             self.stream.set(cv2.CAP_PROP_FRAME_HEIGHT, resolution[1])
             self.stream.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Minimize internal V4L2/DirectShow buffer
 
-        self.grabbed = False
-        self.frame = None
+        self.q = queue.Queue(maxsize=1)
         
         if not self.is_synthetic:
-            self.grabbed, self.frame = self.stream.read()
+            grabbed, frame = self.stream.read()
+            if grabbed:
+                self.q.put(frame)
         else:
-            self.frame = self._generate_synthetic_frame()
-            self.grabbed = True
+            self.q.put(self._generate_synthetic_frame())
 
         self.stopped = False
         self.lock = threading.Lock()
@@ -67,17 +68,23 @@ class UVCVideoStream:
             if self.is_synthetic:
                 frame = self._generate_synthetic_frame()
                 time.sleep(1 / 30.0) # Simulate 30 FPS
-                with self.lock:
-                    self.frame = frame
-                    self.grabbed = True
+                grabbed = True
             else:
                 grabbed, frame = self.stream.read()
                 if not grabbed:
                     self.stop()
                     return
-                with self.lock:
-                    self.grabbed = grabbed
-                    self.frame = frame
+            
+            # Push to queue, overwrite if full to drop backlog
+            if grabbed:
+                try:
+                    self.q.put_nowait(frame)
+                except queue.Full:
+                    try:
+                        self.q.get_nowait()
+                        self.q.put_nowait(frame)
+                    except queue.Empty:
+                        pass
             
             # FPS tracking
             self.fps_frames += 1
@@ -89,11 +96,12 @@ class UVCVideoStream:
                 self.fps_frames = 0
 
     def read(self):
-        # Return the frame most recently read
-        with self.lock:
-            if self.frame is None:
-                return self.grabbed, None
-            return self.grabbed, self.frame.copy()
+        # Non-blocking read; returns (False, None) if no new frame
+        try:
+            frame = self.q.get_nowait()
+            return True, frame
+        except queue.Empty:
+            return False, None
 
     def stop(self):
         # Indicate that the thread should be stopped
